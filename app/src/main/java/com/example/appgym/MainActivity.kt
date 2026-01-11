@@ -1,21 +1,24 @@
 package com.example.appgym
 
 import android.Manifest
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.speech.RecognizerIntent
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.filled.FitnessCenter
+import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -29,13 +32,13 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
-import androidx.room.*
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
@@ -55,8 +58,17 @@ private enum class Tab { Workout, Timer, History, Settings }
 @Composable
 private fun AppGymApp() {
     val context = LocalContext.current
-    val db = remember { AppGymDb.get(context.applicationContext) }
-    val repo = remember { WorkoutRepository(db.workoutDao()) }
+    val db = remember { AppDb.get(context.applicationContext) }
+
+    val repo = remember {
+        WorkoutRepository(
+            workoutDao = db.workoutDao(),
+            exerciseDao = db.exerciseDao(),
+            timerDao = db.timerDao(),
+            voiceDao = db.voiceDao()
+        )
+    }
+
     val vm: AppViewModel = androidx.lifecycle.viewmodel.compose.viewModel(
         factory = AppViewModelFactory(repo)
     )
@@ -68,11 +80,11 @@ private fun AppGymApp() {
     var timerRemainingSec by rememberSaveable { mutableIntStateOf(0) }
     var timerTotalSec by rememberSaveable { mutableIntStateOf(0) }
 
-    // Settings (kept simple; if later quieres persistirlo, se mete en DataStore)
+    // Settings (MVP in-memory; si quieres persistir, DataStore)
     var autoStartTimer by rememberSaveable { mutableStateOf(true) }
     var defaultRestSec by rememberSaveable { mutableIntStateOf(120) }
 
-    // Timer ticking (shared)
+    // Timer ticking
     LaunchedEffect(timerRunning, timerRemainingSec) {
         if (!timerRunning) return@LaunchedEffect
         if (timerRemainingSec <= 0) {
@@ -141,6 +153,7 @@ private fun AppGymApp() {
                 defaultRestSec = defaultRestSec,
                 onStartTimer = { secs -> startTimer(secs) }
             )
+
             Tab.Timer -> TimerScreen(
                 modifier = modifier,
                 running = timerRunning,
@@ -155,10 +168,11 @@ private fun AppGymApp() {
                     timerRunning = false
                 }
             )
+
             Tab.History -> HistoryScreen(
-                modifier = modifier,
-                vm = vm
+                modifier = modifier
             )
+
             Tab.Settings -> SettingsScreen(
                 modifier = modifier,
                 autoStartTimer = autoStartTimer,
@@ -171,7 +185,7 @@ private fun AppGymApp() {
 }
 
 /* --------------------------
-   Workout Screen (DB = source of truth)
+   Workout Screen (DB-backed via repo)
 --------------------------- */
 
 @Composable
@@ -182,20 +196,23 @@ private fun WorkoutScreen(
     defaultRestSec: Int,
     onStartTimer: (Int) -> Unit
 ) {
-    val today = remember { todayIso() }
-    val todaySets by vm.observeSetsByDate(today).collectAsStateWithLifecycle(initialValue = emptyList())
+    val activeSessionId by vm.activeSessionId.collectAsStateWithLifecycle()
 
-    var exercise by rememberSaveable { mutableStateOf("") }
+    val sets by vm.observeActiveSessionSets()
+        .collectAsStateWithLifecycle(initialValue = emptyList())
+
+    val nameById by vm.exerciseNameById
+        .collectAsStateWithLifecycle(initialValue = emptyMap())
+
+    var exerciseName by rememberSaveable { mutableStateOf("") }
     var weight by rememberSaveable { mutableStateOf("") }
     var reps by rememberSaveable { mutableStateOf("") }
     var rpe by rememberSaveable { mutableStateOf("") }
     var restSec by rememberSaveable { mutableStateOf(defaultRestSec.toString()) }
 
-    var lastHeard by rememberSaveable { mutableStateOf<String?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
-    // si el usuario cambia Settings, reflejamos rest por defecto al menos cuando vacío
     LaunchedEffect(defaultRestSec) {
         if (restSec.isBlank()) restSec = defaultRestSec.toString()
     }
@@ -211,12 +228,14 @@ private fun WorkoutScreen(
                 .fillMaxSize(),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text("Today: $today", style = MaterialTheme.typography.titleMedium)
+            Text(
+                text = if (activeSessionId == null) "Session: (creating...)" else "Session: active",
+                style = MaterialTheme.typography.titleMedium
+            )
 
-            // Input row
             OutlinedTextField(
-                value = exercise,
-                onValueChange = { exercise = it },
+                value = exerciseName,
+                onValueChange = { exerciseName = it },
                 label = { Text("Exercise") },
                 modifier = Modifier.fillMaxWidth()
             )
@@ -254,20 +273,16 @@ private fun WorkoutScreen(
                     modifier = Modifier.weight(1f)
                 )
 
-                // Voz (Iteración 6 robusta): permiso + relaunch si concede
                 VoiceInputButton(
                     modifier = Modifier.align(Alignment.CenterVertically),
                     onHeard = { text ->
-                        lastHeard = text
-                        scope.launch {
-                            snackbarHostState.showSnackbar("Heard: $text")
-                        }
-                        // Parsing MVP (opción C no ahora, pero suficiente para auto-fill)
+                        scope.launch { snackbarHostState.showSnackbar("Heard: $text") }
+
                         val parsed = parseWorkoutSpeech(text)
-                        if (parsed.exercise.isNotBlank()) exercise = parsed.exercise
+                        if (parsed.exercise.isNotBlank()) exerciseName = parsed.exercise
                         parsed.weightKg?.let { weight = stripTrailingZeros(it) }
                         parsed.reps?.let { reps = it.toString() }
-                        parsed.rpe?.let { rpe = it.toString() }
+                        parsed.rpe?.let { rpe = stripTrailingZeros(it) }
                     }
                 )
             }
@@ -275,31 +290,32 @@ private fun WorkoutScreen(
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Button(
                     onClick = {
-                        val ex = exercise.trim()
+                        val ex = exerciseName.trim()
                         if (ex.isBlank()) {
                             scope.launch { snackbarHostState.showSnackbar("Exercise is required") }
                             return@Button
                         }
-                        val w = weight.toFloatOrNull()
+
+                        val w = weight.toDoubleOrNull()
                         val rp = reps.toIntOrNull()
                         if (w == null || rp == null) {
                             scope.launch { snackbarHostState.showSnackbar("Weight and reps must be numeric") }
                             return@Button
                         }
-                        val rpeInt = rpe.toIntOrNull()
+
+                        val rpeVal = rpe.toDoubleOrNull()
                         val rest = restSec.toIntOrNull() ?: defaultRestSec
 
                         vm.addSet(
-                            date = today,
-                            exercise = ex,
+                            exerciseName = ex,
                             weightKg = w,
                             reps = rp,
-                            rpe = rpeInt
+                            rpe = rpeVal
                         )
 
                         if (autoStartTimer) onStartTimer(rest)
 
-                        // UX: limpia reps/RPE pero deja ejercicio y peso (conveniente)
+                        // Limpia reps/RPE, conserva ejercicio/peso
                         reps = ""
                         rpe = ""
                     }
@@ -307,46 +323,40 @@ private fun WorkoutScreen(
 
                 OutlinedButton(
                     onClick = {
-                        exercise = ""
+                        exerciseName = ""
                         weight = ""
                         reps = ""
                         rpe = ""
                         restSec = defaultRestSec.toString()
-                        lastHeard = null
                     }
                 ) { Text("Clear") }
             }
 
             HorizontalDivider()
 
-            Text("Sets", style = MaterialTheme.typography.titleMedium)
+            Text("Sets (active session)", style = MaterialTheme.typography.titleMedium)
 
-            if (todaySets.isEmpty()) {
+            if (sets.isEmpty()) {
                 Text("No sets yet.")
             } else {
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    items(todaySets, key = { it.id }) { s ->
+                    items(sets, key = { it.setId }) { s ->
                         SetRow(
                             set = s,
-                            onDelete = { vm.deleteSet(s) }
+                            exerciseName = nameById[s.exerciseId] ?: s.exerciseId
                         )
                     }
                 }
-            }
-
-            lastHeard?.let {
-                Spacer(Modifier.height(4.dp))
-                Text("Last heard: $it", style = MaterialTheme.typography.bodySmall)
             }
         }
     }
 }
 
 @Composable
-private fun SetRow(set: WorkoutSetEntity, onDelete: () -> Unit) {
+private fun SetRow(set: WorkoutSetEntity, exerciseName: String) {
     Card(Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
@@ -355,13 +365,12 @@ private fun SetRow(set: WorkoutSetEntity, onDelete: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column(Modifier.weight(1f)) {
-                Text(set.exercise, style = MaterialTheme.typography.titleSmall)
-                val rpeText = set.rpe?.let { " | RPE $it" } ?: ""
-                Text("${stripTrailingZeros(set.weightKg)} kg × ${set.reps}$rpeText", style = MaterialTheme.typography.bodyMedium)
+                Text(exerciseName, style = MaterialTheme.typography.titleSmall)
+                val rpeText = set.rpe?.let { " | RPE ${stripTrailingZeros(it)}" } ?: ""
+                val wText = set.weightKg?.let { stripTrailingZeros(it) } ?: "-"
+                Text("$wText kg × ${set.reps}$rpeText", style = MaterialTheme.typography.bodyMedium)
             }
-            IconButton(onClick = onDelete) {
-                Icon(Icons.Default.Delete, contentDescription = "Delete")
-            }
+            Text("#${set.setNumber}", style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -394,11 +403,9 @@ private fun TimerScreen(
         Text("$mm:$ss", style = MaterialTheme.typography.displayMedium)
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            if (!running) {
-                Button(onClick = onStart) { Text("Start") }
-            } else {
-                Button(onClick = onStop) { Text("Stop") }
-            }
+            if (!running) Button(onClick = onStart) { Text("Start") }
+            else Button(onClick = onStop) { Text("Stop") }
+
             OutlinedButton(onClick = onReset) { Text("Reset") }
         }
 
@@ -413,10 +420,7 @@ private fun TimerScreen(
         )
 
         Button(
-            onClick = {
-                val secs = input.toIntOrNull()
-                if (secs != null) onSet(secs)
-            }
+            onClick = { input.toIntOrNull()?.let { onSet(it) } }
         ) { Text("Apply") }
 
         Spacer(Modifier.height(12.dp))
@@ -426,111 +430,21 @@ private fun TimerScreen(
 }
 
 /* --------------------------
-   History Screen (useful, DB-backed)
+   History Screen (placeholder estable)
 --------------------------- */
 
-private enum class HistoryRange(val label: String, val days: Int) {
-    Last7("Last 7 days", 7),
-    Last30("Last 30 days", 30),
-    Last90("Last 90 days", 90),
-    All("All", 3650)
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun HistoryScreen(
-    modifier: Modifier,
-    vm: AppViewModel
-) {
-    var range by rememberSaveable { mutableStateOf(HistoryRange.Last30) }
-    var selectedDate by rememberSaveable { mutableStateOf<String?>(null) }
-
-    val summaries by vm.observeDaySummaries(range.days).collectAsStateWithLifecycle(initialValue = emptyList())
-    val setsForSelected by vm.observeSetsByDate(selectedDate ?: "").collectAsStateWithLifecycle(initialValue = emptyList())
-
+private fun HistoryScreen(modifier: Modifier) {
     Column(
         modifier = modifier.padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Text("History", style = MaterialTheme.typography.titleLarge)
-
-        // Range selector
-        var expanded by remember { mutableStateOf(false) }
-        ExposedDropdownMenuBox(
-            expanded = expanded,
-            onExpandedChange = { expanded = it }
-        ) {
-            OutlinedTextField(
-                value = range.label,
-                onValueChange = {},
-                readOnly = true,
-                label = { Text("Range") },
-                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-                modifier = Modifier.menuAnchor().fillMaxWidth()
-            )
-            ExposedDropdownMenu(
-                expanded = expanded,
-                onDismissRequest = { expanded = false }
-            ) {
-                HistoryRange.entries.forEach { r ->
-                    DropdownMenuItem(
-                        text = { Text(r.label) },
-                        onClick = {
-                            range = r
-                            expanded = false
-                            selectedDate = null
-                        }
-                    )
-                }
-            }
-        }
-
-        HorizontalDivider()
-
-        if (selectedDate == null) {
-            if (summaries.isEmpty()) {
-                Text("No history yet.")
-            } else {
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxSize()) {
-                    items(summaries, key = { it.date }) { d ->
-                        Card(
-                            Modifier
-                                .fillMaxWidth()
-                                .clickable { selectedDate = d.date }
-                        ) {
-                            Row(
-                                Modifier.padding(12.dp).fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(Modifier.weight(1f)) {
-                                    Text(d.date, style = MaterialTheme.typography.titleSmall)
-                                    Text("${d.setCount} sets", style = MaterialTheme.typography.bodySmall)
-                                }
-                                val vol = (d.volume ?: 0f)
-                                Text("${stripTrailingZeros(vol)} kg·reps", style = MaterialTheme.typography.bodyMedium)
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = { selectedDate = null }) {
-                    Icon(Icons.Default.ArrowBack, contentDescription = "Back")
-                }
-                Text(selectedDate!!, style = MaterialTheme.typography.titleMedium)
-            }
-
-            if (setsForSelected.isEmpty()) {
-                Text("No sets for that day.")
-            } else {
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxSize()) {
-                    items(setsForSelected, key = { it.id }) { s ->
-                        SetRow(set = s, onDelete = { vm.deleteSet(s) })
-                    }
-                }
-            }
-        }
+        Text(
+            "History UI will be implemented next (requires a couple of extra DAO queries: " +
+                    "observeAllSets() and day grouping).",
+            style = MaterialTheme.typography.bodyMedium
+        )
     }
 }
 
@@ -569,8 +483,7 @@ private fun SettingsScreen(
         )
 
         Button(onClick = {
-            val v = restInput.toIntOrNull()
-            if (v != null) onDefaultRestSecChange(v)
+            restInput.toIntOrNull()?.let { onDefaultRestSecChange(it) }
         }) { Text("Apply") }
 
         HorizontalDivider()
@@ -583,7 +496,7 @@ private fun SettingsScreen(
 }
 
 /* --------------------------
-   VoiceInputButton (Iteración 6 robusta)
+   VoiceInputButton (robusto)
 --------------------------- */
 
 @Composable
@@ -595,30 +508,30 @@ private fun VoiceInputButton(
     var pendingLaunch by remember { mutableStateOf(false) }
     var launchInProgress by remember { mutableStateOf(false) }
 
-    val permissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission(),
-        onResult = { granted ->
-            if (granted && pendingLaunch && !launchInProgress) {
-                pendingLaunch = false
-                launchInProgress = true
-                speechLauncher.launch(buildSpeechIntent())
-            } else {
-                pendingLaunch = false
-                launchInProgress = false
-            }
-        }
-    )
-
+    // 1) Speech launcher primero (porque permission callback lo usa)
     val speechLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult(),
-        onResult = { res ->
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { res ->
+        launchInProgress = false
+        val data = res.data ?: return@rememberLauncherForActivityResult
+        val results = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+        val text = results?.firstOrNull()?.trim()
+        if (!text.isNullOrBlank()) onHeard(text)
+    }
+
+    // 2) Permission launcher después
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted && pendingLaunch && !launchInProgress) {
+            pendingLaunch = false
+            launchInProgress = true
+            speechLauncher.launch(buildSpeechIntent())
+        } else {
+            pendingLaunch = false
             launchInProgress = false
-            val data = res.data ?: return@rememberLauncherForActivityResult
-            val results = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
-            val text = results?.firstOrNull()?.trim()
-            if (!text.isNullOrBlank()) onHeard(text)
         }
-    )
+    }
 
     IconButton(
         modifier = modifier,
@@ -651,7 +564,6 @@ private fun buildSpeechIntent(): Intent {
         putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
 
-        // Tolerancia a pausas / silencio (mejora UX, aunque en emulador puede ser irrelevante)
         putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
         putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 800L)
         putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1800L)
@@ -659,40 +571,32 @@ private fun buildSpeechIntent(): Intent {
 }
 
 /* --------------------------
-   Parsing MVP (suficiente para autofill hoy)
+   Parsing MVP (autofill)
 --------------------------- */
 
 private data class ParsedSpeech(
     val exercise: String,
-    val weightKg: Float?,
+    val weightKg: Double?,
     val reps: Int?,
-    val rpe: Int?
+    val rpe: Double?
 )
 
-// Ejemplos que cubre razonablemente:
-// "press banca 80 kilos 7 reps rpe 9"
-// "banca 82,5 6 rpe 8"
-// "sentadilla 120 x5 rpe9"
 private fun parseWorkoutSpeech(text: String): ParsedSpeech {
     val normalized = text
         .lowercase(Locale("es", "ES"))
         .replace(',', '.')
         .trim()
 
-    // Peso: primer número con posible decimal seguido opcionalmente de "kg/kilos"
-    val weightRegex = Regex("""(\d{1,3}(?:\.\d{1,2})?)\s*(kg|kilo|kilos)?""")
-    val weight = weightRegex.find(normalized)?.groupValues?.getOrNull(1)?.toFloatOrNull()
+    val weightRegex = Regex("""(\d{1,3}(?:\.\d{1,3})?)\s*(kg|kilo|kilos)?""")
+    val weight = weightRegex.find(normalized)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
 
-    // Reps: busca "x5" o "5 rep" o "5 reps" o "repeticiones 5"
     val reps =
         Regex("""x\s*(\d{1,2})""").find(normalized)?.groupValues?.getOrNull(1)?.toIntOrNull()
             ?: Regex("""(\d{1,2})\s*(rep|reps|repeticiones)""").find(normalized)?.groupValues?.getOrNull(1)?.toIntOrNull()
 
-    // RPE: "rpe 9" o "rpe9"
     val rpe =
-        Regex("""rpe\s*(\d{1,2})""").find(normalized)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        Regex("""rpe\s*(\d{1,2}(?:\.\d)?)""").find(normalized)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
 
-    // Ejercicio: heurística: texto hasta el peso o hasta "x"
     val cutIdx = run {
         val idxWeight = weightRegex.find(normalized)?.range?.first ?: Int.MAX_VALUE
         val idxX = normalized.indexOf('x').takeIf { it >= 0 } ?: Int.MAX_VALUE
@@ -710,139 +614,55 @@ private fun parseWorkoutSpeech(text: String): ParsedSpeech {
     )
 }
 
-private fun stripTrailingZeros(value: Float): String {
+private fun stripTrailingZeros(value: Double): String {
     val i = value.roundToInt()
-    return if (kotlin.math.abs(value - i.toFloat()) < 0.0001f) i.toString() else value.toString()
+    return if (abs(value - i.toDouble()) < 0.0001) i.toString() else value.toString()
 }
 
 /* --------------------------
-   Date helpers
+   ViewModel (adaptado a AppDb + WorkoutRepository)
 --------------------------- */
-
-private fun todayIso(): String {
-    val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-    return sdf.format(Date())
-}
-
-private fun isoDaysAgo(days: Int): String {
-    val ms = System.currentTimeMillis() - (days.toLong() * 24L * 60L * 60L * 1000L)
-    val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-    return sdf.format(Date(ms))
-}
-
-/* --------------------------
-   Room: Entity + DAO + DB
---------------------------- */
-
-@Entity(tableName = "workout_sets")
-data class WorkoutSetEntity(
-    @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    @ColumnInfo(index = true) val date: String, // ISO yyyy-MM-dd (string sort OK)
-    val exercise: String,
-    val weightKg: Float,
-    val reps: Int,
-    val rpe: Int? = null,
-    val createdAtMs: Long = System.currentTimeMillis()
-)
-
-data class DaySummary(
-    val date: String,
-    val setCount: Int,
-    val volume: Float?
-)
-
-@Dao
-interface WorkoutDao {
-    @Insert
-    suspend fun insertSet(set: WorkoutSetEntity)
-
-    @Delete
-    suspend fun deleteSet(set: WorkoutSetEntity)
-
-    @Query("SELECT * FROM workout_sets WHERE date = :date ORDER BY createdAtMs DESC")
-    fun observeSetsByDate(date: String): Flow<List<WorkoutSetEntity>>
-
-    @Query("""
-        SELECT date as date,
-               COUNT(*) as setCount,
-               SUM(weightKg * reps) as volume
-        FROM workout_sets
-        WHERE date >= :fromDate
-        GROUP BY date
-        ORDER BY date DESC
-    """)
-    fun observeDaySummaries(fromDate: String): Flow<List<DaySummary>>
-}
-
-@Database(
-    entities = [WorkoutSetEntity::class],
-    version = 1,
-    exportSchema = false
-)
-abstract class AppGymDb : RoomDatabase() {
-    abstract fun workoutDao(): WorkoutDao
-
-    companion object {
-        @Volatile private var INSTANCE: AppGymDb? = null
-
-        fun get(context: Context): AppGymDb {
-            return INSTANCE ?: synchronized(this) {
-                INSTANCE ?: Room.databaseBuilder(
-                    context,
-                    AppGymDb::class.java,
-                    "appgym.db"
-                ).build().also { INSTANCE = it }
-            }
-        }
-    }
-}
-
-/* --------------------------
-   Repo + ViewModel
---------------------------- */
-
-private class WorkoutRepository(private val dao: WorkoutDao) {
-    fun observeSetsByDate(date: String): Flow<List<WorkoutSetEntity>> = dao.observeSetsByDate(date)
-    fun observeDaySummaries(daysBack: Int): Flow<List<DaySummary>> {
-        val from = isoDaysAgo(daysBack - 1)
-        return dao.observeDaySummaries(from)
-    }
-
-    suspend fun addSet(date: String, exercise: String, weightKg: Float, reps: Int, rpe: Int?) {
-        dao.insertSet(
-            WorkoutSetEntity(
-                date = date,
-                exercise = exercise,
-                weightKg = weightKg,
-                reps = reps,
-                rpe = rpe
-            )
-        )
-    }
-
-    suspend fun deleteSet(set: WorkoutSetEntity) = dao.deleteSet(set)
-}
 
 private class AppViewModel(private val repo: WorkoutRepository) : ViewModel() {
-    fun observeSetsByDate(date: String): Flow<List<WorkoutSetEntity>> {
-        if (date.isBlank()) {
-            // Para evitar queries raras cuando selectedDate es null
-            return kotlinx.coroutines.flow.flowOf(emptyList())
+
+    // Active session
+    private val _activeSessionId = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+    val activeSessionId: kotlinx.coroutines.flow.StateFlow<String?> = _activeSessionId
+
+    // exerciseId -> name mapping (para pintar listas)
+    val exerciseNameById: Flow<Map<String, String>> =
+        repo.observeExercises()
+            .map { list -> list.associate { it.exerciseId to it.name } }
+
+    init {
+        viewModelScope.launch {
+            _activeSessionId.value = repo.getOrCreateActiveSessionId()
         }
-        return repo.observeSetsByDate(date)
     }
 
-    fun observeDaySummaries(daysBack: Int): Flow<List<DaySummary>> = repo.observeDaySummaries(daysBack)
-
-    fun addSet(date: String, exercise: String, weightKg: Float, reps: Int, rpe: Int?) {
-        viewModelScope.launch {
-            repo.addSet(date, exercise, weightKg, reps, rpe)
-        }
+    fun observeActiveSessionSets(): Flow<List<WorkoutSetEntity>> {
+        val sid = _activeSessionId.value
+        return if (sid.isNullOrBlank()) flowOf(emptyList())
+        else repo.observeSetsForSession(sid)
     }
 
-    fun deleteSet(set: WorkoutSetEntity) {
+    fun addSet(
+        exerciseName: String,
+        weightKg: Double?,
+        reps: Int,
+        rpe: Double?
+    ) {
         viewModelScope.launch {
-            repo.deleteSet(set)
+            val sid = _activeSessionId.value ?: repo.getOrCreateActiveSessionId().also { _activeSessionId.value = it }
+            val exerciseId = repo.ensureExerciseIdByName(exerciseName)
+            repo.addSet(
+                sessionId = sid,
+                exerciseId = exerciseId,
+                reps = reps,
+                weightKg = weightKg,
+                rpe = rpe,
+                source = "MANUAL"
+            )
         }
     }
 }
@@ -853,3 +673,4 @@ private class AppViewModelFactory(private val repo: WorkoutRepository) : ViewMod
         return AppViewModel(repo) as T
     }
 }
+
