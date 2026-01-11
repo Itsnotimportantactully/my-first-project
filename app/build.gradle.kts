@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("kotlin-kapt")
     id("org.jetbrains.kotlin.plugin.compose")
     id("com.google.devtools.ksp")
 }
@@ -49,6 +50,14 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.navigation:navigation-compose:2.9.6")
+    implementation("androidx.compose.material:material-icons-extended")
+    // Room (persistencia local)
+    implementation("androidx.room:room-runtime:2.6.1")
+    implementation("androidx.room:room-ktx:2.6.1")
+    kapt("androidx.room:room-compiler:2.6.1")
+    // Para collectAsStateWithLifecycle (recomendado con Flows)
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
@@ -60,4 +69,7 @@ dependencies {
 
     // Billing (skeleton)
     implementation("com.android.billingclient:billing-ktx:7.1.1")
+}
+kapt {
+    correctErrorTypes = true
 }

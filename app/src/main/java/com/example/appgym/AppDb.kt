@@ -186,12 +186,8 @@ abstract class AppDb : RoomDatabase() {
 
         fun get(context: Context): AppDb =
             INSTANCE ?: synchronized(this) {
-                INSTANCE ?: Room.databaseBuilder(
-                    context.applicationContext,
-                    AppDb::class.java,
-                    "appgym.db"
-                )
-                    .fallbackToDestructiveMigration()
+                INSTANCE ?: Room.databaseBuilder(context, AppDb::class.java, "appgym.db")
+                    .fallbackToDestructiveMigration(/* dropAllTables = */ true)
                     .build()
                     .also { INSTANCE = it }
             }
